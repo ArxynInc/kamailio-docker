@@ -1,0 +1,102 @@
+# =============================================================================
+# Track kamailio/kamailio-docker 5.8.x branch — auto-rebase + rebuild
+# =============================================================================
+# Daily cron. Compares the upstream's `5.8.x` branch HEAD (where
+# kamailio/kamailio-docker bumps the version pin in bookworm/Dockerfile
+# each time deb.kamailio.org rotates to a newer 5.8.x point release).
+#
+# When upstream advances 5.8.x, opens a PR merging it into our 5.8.x
+# branch. Merging the PR triggers arxyn-multiarch.yml to rebuild +
+# republish our multi-arch image at the new point release.
+#
+# We don't track 6.x — that's a major-version jump and needs human
+# evaluation (config syntax + module behavior changes). To migrate to
+# 6.x, manually fetch + push the upstream 6.x branch into our fork
+# and update the kustomize image tag.
+# =============================================================================
+name: upstream-tracker
+
+on:
+  schedule:
+    - cron: "45 6 * * *"  # 06:45 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-tracker
+  cancel-in-progress: false
+
+jobs:
+  fetch-upstream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: '5.8.x'   # our tracking branch — upstream's name for it
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/kamailio/kamailio-docker.git || true
+
+      - name: Detect upstream-branch we follow
+        id: detect
+        run: |
+          # We currently track upstream's "5.8.8" branch (named after the
+          # latest patch level). When upstream cuts 5.8.9 they push a new
+          # 5.8.9 branch with the version pin updated. So the "latest" we
+          # care about is the highest 5.8.x branch.
+          git fetch upstream --quiet
+          LATEST=$(git branch -r --list 'upstream/5.8.*' | sed 's|.*/||' | sort -V | tail -1)
+          CURRENT=$(grep -oE 'kamailio=5\.8\.[0-9]+\+bpo' bookworm/Dockerfile | head -1 | sed 's|kamailio=||;s|\+bpo||')
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          if [ -z "$LATEST" ] || [ "$LATEST" = "$CURRENT" ]; then
+            echo "skip=true" >> $GITHUB_ENV
+            echo "Already on latest $CURRENT"
+          fi
+
+      - name: Merge upstream branch into ours
+        if: env.skip != 'true'
+        run: |
+          BR="chore/upstream-bump-${{ steps.detect.outputs.latest }}"
+          git checkout -b "$BR"
+          if ! git merge "upstream/${{ steps.detect.outputs.latest }}" --no-edit; then
+            git checkout --ours .github/workflows/arxyn-multiarch.yml .github/workflows/upstream-tracker.yml || true
+            git add .github/workflows/arxyn-multiarch.yml .github/workflows/upstream-tracker.yml || true
+            git commit --no-edit -a || true
+          fi
+          git push origin "$BR"
+          echo "branch=$BR" >> $GITHUB_ENV
+
+      - name: Open PR
+        if: env.skip != 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ env.branch }}
+          base: 5.8.x
+          title: "chore: bump kamailio ${{ steps.detect.outputs.current }} → ${{ steps.detect.outputs.latest }}"
+          body: |
+            Automated upstream tracker.
+
+            kamailio/kamailio-docker cut a new 5.8.x patch release:
+              - Previous: `${{ steps.detect.outputs.current }}`
+              - New:      `${{ steps.detect.outputs.latest }}`
+
+            Merging this PR triggers `arxyn-multiarch.yml` to rebuild
+            and republish `ghcr.io/arxyninc/kamailio:${{ steps.detect.outputs.latest }}-bookworm`.
+
+            **After merging:** bump the kustomize image tag in
+            ArxynInc/freeswitch-scalable `k8s/overlays/aws-*/kustomization.yaml`
+            so dev + prod pick up the new image.
+          labels: |
+            dependencies
+            upstream-merge
