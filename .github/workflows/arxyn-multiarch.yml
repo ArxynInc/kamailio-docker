@@ -1,0 +1,116 @@
+# =============================================================================
+# Build + publish kamailio multi-arch (amd64 + arm64) to GHCR
+# =============================================================================
+# Fork of kamailio/kamailio-docker. The upstream `get-platforms.sh` caps
+# arm64 publication at kamailio 6.1.x and above:
+#
+#   supported=('linux/amd64')
+#   if [[ ${GITHUB_REF:-} =~ refs/heads/([5-9])\.([0-9]+)\.[0-9]+ ]] ; then
+#     if [[ "${BASH_REMATCH[1]}" -ge 6 ]] && [[ "${BASH_REMATCH[2]}" -ge 1 ]] ; then
+#       supported+=('linux/arm64')
+#     fi
+#   fi
+#
+# We run kamailio 5.8.x in production and don't want to take the major
+# version jump just to get Graviton. `deb.kamailio.org/kamailio58/`
+# already publishes arm64 packages — `apt-get install kamailio` Just
+# Works on arm64. So we override the gate here and publish multi-arch
+# directly from the unmodified bookworm/Dockerfile.
+#
+# Triggers (only on this branch — keeps upstream tag namespace intact):
+#   - push to 5.8.x branches
+#   - workflow_dispatch (lets us rebuild on apt-repo updates)
+#
+# Output: ghcr.io/arxyninc/kamailio:<branch>-<dist>
+#   e.g. ghcr.io/arxyninc/kamailio:5.8.0-bookworm
+# =============================================================================
+name: arxyn-multiarch
+
+on:
+  push:
+    branches:
+      - '5.8.*'
+  workflow_dispatch:
+    inputs:
+      dist:
+        description: Debian/Ubuntu codename to build for (default bookworm)
+        required: false
+        default: bookworm
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: arxyninc/kamailio
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60   # arm64 under QEMU is slow
+    strategy:
+      fail-fast: false
+      matrix:
+        dist:
+          - ${{ github.event.inputs.dist || 'bookworm' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU lets the amd64 runner emit linux/arm64 layers. Mirror the
+      # rtpengine fork's setup so future ops don't context-switch
+      # between two CI patterns.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ github.ref_name }}-${{ matrix.dist }}
+            type=raw,value=${{ github.ref_name }}-${{ matrix.dist }}-${{ github.run_number }}
+          labels: |
+            org.opencontainers.image.title=kamailio
+            org.opencontainers.image.description=Kamailio SIP server, multi-arch (amd64+arm64) fork — backports arm64 to 5.8.x
+            org.opencontainers.image.source=https://github.com/ArxynInc/kamailio-docker
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.licenses=GPL-2.0
+
+      - name: Build + push multi-arch
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.dist }}
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=kamailio-${{ matrix.dist }}-multiarch
+          cache-to: type=gha,scope=kamailio-${{ matrix.dist }}-multiarch,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Summary
+        run: |
+          echo "## kamailio multi-arch build" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags pushed:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Architectures:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
